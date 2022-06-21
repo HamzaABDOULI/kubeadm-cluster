@@ -1,0 +1,99 @@
+---
+
+- name: copy kubeadm config file
+  template:
+    src: kubeadm.init.yaml
+    dest: /root/.
+
+- name: initialize kubeadm cluster
+  shell:
+    # have not been able to get config to work properly with all variables I want
+    #cmd: kubeadm init --config=/root/kubeadm.init.yaml >> cluster_initialized.txt 2>&1
+    cmd: kubeadm init --pod-network-cidr={{pod_cidr}} --service-cidr={{service_cidr}} --apiserver-advertise-address={{master_ip}} >> cluster_initialized.txt 2>&1
+  args:
+    #chdir: $HOME
+    creates: cluster_initialized.txt
+
+- name: create .kube directory
+  become_user: ubuntu
+  file:
+    path: $HOME/.kube
+    state: directory
+    mode: 0755
+
+- name: copy admin.conf to user's kube config
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: yes
+    owner: ubuntu
+
+# flanneld located at '/opt/cni/bin' for kubeadm (and not '/opt/bin')
+# do not need k8s-manifests/kube-flannel-rbac.yml in newer versions
+- name: get flannel manifest, use our own pod CIDR block instead of default which ends up in configmap kube-system/kube-flannel-cfg
+  shell: 
+    cmd: curl -fsSL https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml | sed 's#10.244.0.0/16#{{pod_cidr}}#' > kube-flannel.yml
+    creates: kube-flannel.yml
+
+- name: install Pod network
+  become_user: ubuntu
+  shell: 
+    cmd: kubectl apply -f kube-flannel.yml >> kube-flannel.log
+  args:
+    creates: kube-flannel.log
+
+- name: is metricsBindAddress set to 0.0.0.0
+  become_user: ubuntu
+  shell:
+    cmd: 'kubectl get configmap/kube-proxy -n kube-system -o json | grep ''metricsBindAddress\: 0.0.0.0:1024'' | wc -l'
+  register: kubeproxy_metricsbind
+- set_fact:
+    kubeproxy_has_metricsbind: "{{ kubeproxy_metricsbind.stdout|int == 1 }}"
+- debug: msg="{{kubeproxy_has_metricsbind}}"
+  
+
+# to avoid KubeProxyDown because metrics binding is empty
+# https://stackoverflow.com/questions/70491211/prometheus-alert-rule-for-absent-discovered-target
+- name: put metricsBindAddress into kube-proxy configmap
+  become_user: ubuntu
+  shell:
+    cmd: 'kubectl get configmap/kube-proxy -n kube-system -o json | sed ''s#metricsBindAddress\: \\"\\"#metricsBindAddress\: 0.0.0.0:10249#'' | kubectl replace -f -'
+  register: kubeproxy_cm_update
+  when: not kubeproxy_has_metricsbind
+- debug:
+    msg: "{{kubeproxy_cm_update.stdout_lines}}"
+  when: kubeproxy_cm_update.changed
+
+- name: rolling restart of kube-proxy daemonset to take changes
+  become_user: ubuntu
+  shell:
+    cmd: kubectl -n kube-system rollout restart daemonset/kube-proxy
+  when: kubeproxy_cm_update.changed
+
+# KubeControllerManagerDown
+# https://github.com/prometheus-operator/kube-prometheus/issues/718
+# https://github.com/prometheus-operator/kube-prometheus/blob/main/docs/kube-prometheus-on-kubeadm.md
+# https://prometheus-operator.dev/docs/kube-prometheus-on-kubeadm/
+- name: replace 'bind-address' for kube-controller-manager so metrics can be read from prometheus
+  replace:
+    path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    regexp:  '--bind-address=127.0.0.1'
+    replace: '--bind-address=0.0.0.0'
+
+- name: replace 'bind-address' for kube-scheduler so metrics can be read from prometheus
+  replace:
+    path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    regexp:  '--bind-address=127.0.0.1'
+    replace: '--bind-address=0.0.0.0'
+
+
+# https://groups.google.com/g/prometheus-users/c/_aI-HySJ-xM
+
+- name: append 'listen-metrics-url' for etcd so metrics can be read from prometheus
+  replace:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    regexp:  '--listen-metrics-urls=http://127.0.0.1:2381$'
+    replace: '--listen-metrics-urls=http://127.0.0.1:2381,http://{{master_ip}}:2381'
+
+# this part has to go into prometheus role because it does not exist before prom is installed
+# etcdInsufficientMembers and TargetDown on job=kube-etcd resolved by modifying -n kube-system service/prom-stack-kube-prometheus-kube-etcd; modified spec.ports[@name=http-metrics].port=2381 .targetPort=2381

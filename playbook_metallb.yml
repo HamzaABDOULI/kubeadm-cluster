@@ -1,0 +1,15 @@
+---
+
+# put MetalLB as peer on host network
+- hosts: localhost
+  connection: local
+  tasks:
+    - set_fact:
+        metal_lb_prefix: "{{ ansible_default_ipv4.address.split('.')[:3]|join('.') }}"
+
+- hosts: control_plane
+  gather_facts: yes
+  become: yes
+  roles:
+    # public LB endpoints managed by MetalLB
+    - role: kubeadm-metallb
